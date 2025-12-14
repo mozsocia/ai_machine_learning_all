@@ -123,3 +123,130 @@ Yes, you can absolutely build an AI agent in Python from scratch without relying
    - Handle errors gracefully, add logging, and test with various queries.
 
 This approach gives you full control and is extensible—start simple and scale by adding more tools or advanced retrieval (e.g., integrating FAISS for vector search without frameworks). For full tutorials, check the linked resources for complete code examples.
+
+### 🔴 So gemini tools defination is different ? Please give me full code for gemini
+
+```python
+import os
+import json
+import wikipedia  # pip install wikipedia
+from typing import Dict, Any
+import google.generativeai as genai
+from google.generativeai.types import FunctionDeclaration, Tool
+
+# Configure API key
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Define tool functions (actual Python implementations)
+def calculate_expression(expression: str) -> str:
+    try:
+        result = eval(expression)  # Use with caution; add safety in production
+        return json.dumps({"result": result})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+def search_wikipedia(query: str) -> str:
+    try:
+        summary = wikipedia.summary(query, sentences=3)
+        return json.dumps({"summary": summary})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+# Tool execution dispatcher
+def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    if name == "calculate_expression":
+        return json.loads(calculate_expression(args.get("expression", "")))
+    elif name == "search_wikipedia":
+        return json.loads(search_wikipedia(args.get("query", "")))
+    return {"error": "Unknown tool"}
+
+# Define tool schemas for Gemini (using FunctionDeclaration class)
+calculate_tool = FunctionDeclaration(
+    name="calculate_expression",
+    description="Evaluate a mathematical expression.",
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "expression": {"type": "STRING", "description": "The math expression to evaluate."}
+        },
+        "required": ["expression"]
+    }
+)
+
+wikipedia_tool = FunctionDeclaration(
+    name="search_wikipedia",
+    description="Search Wikipedia for information.",
+    parameters={
+        "type": "OBJECT",
+        "properties": {
+            "query": {"type": "STRING", "description": "The search query for Wikipedia."}
+        },
+        "required": ["query"]
+    }
+)
+
+# Group tools
+tools = Tool(function_declarations=[calculate_tool, wikipedia_tool])
+
+# Initialize the model with tools
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-pro",  # Or 'gemini-1.5-flash' for faster responses
+    tools=[tools],
+    system_instruction="You are a helpful agent that uses tools to answer questions. Reason step by step. If you need information or calculations, call the appropriate tool."
+)
+
+# Agent processing function (ReAct-style loop)
+def process_query(user_query: str, max_iterations: int = 5) -> str:
+    chat = model.start_chat(history=[])
+    # Send initial user query
+    response = chat.send_message(user_query)
+    
+    iteration = 0
+    while iteration < max_iterations:
+        function_calls = [part.function_call for part in response.parts if part.function_call]
+        if not function_calls:
+            # No more tool calls; return the final text response
+            return response.text
+        
+        # Handle each function call (Gemini can propose multiple in one response)
+        for fc in function_calls:
+            # Execute the tool
+            tool_result = execute_tool(fc.name, dict(fc.args))  # args is a dict
+            
+            # Create function response part
+            fr_part = genai.protos.Part(
+                function_response=genai.protos.FunctionResponse(
+                    name=fc.name,
+                    response={"output": json.dumps(tool_result)}  # Wrap result as JSON string or dict
+                )
+            )
+            
+            # Send the function response back to the model
+            response = chat.send_message(fr_part)
+        
+        iteration += 1
+    
+    return "Max iterations reached without resolution."
+
+# Example usage
+if __name__ == "__main__":
+    query = "What is the capital of Japan? Use a tool if needed."
+    answer = process_query(query)
+    print("Answer:", answer)
+
+    # For multi-turn, reuse the same chat object
+    # next_response = chat.send_message("Now calculate 2 + 2 * 3")
+```
+
+Yes, Gemini's tool definitions (function declarations) are similar to OpenAI's but use a slightly different schema format: parameter types are uppercase strings like "STRING" or "OBJECT" (instead of lowercase), and it's wrapped in `FunctionDeclaration` and `Tool` classes from the SDK. The API handling also differs—Gemini uses a `start_chat` for conversational history and manages function calls via `Part` objects with `function_call` or `function_response`.
+
+This is a complete, self-contained Python script for your agent using Gemini. It includes tool calling for calculations and Wikipedia search (as a basic RAG mechanism—retrieving external knowledge). You can extend it by adding more tools or a custom vector-based RAG (e.g., using `sentence-transformers` for embeddings and cosine similarity in a custom retrieval function).
+
+Key notes:
+- **Install dependencies**: `pip install google-generativeai wikipedia`
+- **API Key**: Set `GOOGLE_API_KEY` in your environment.
+- **RAG Extension**: For a more advanced RAG, add a tool that searches a local knowledge base (e.g., load documents, compute embeddings with `numpy` and `sentence-transformers`, and retrieve top-k matches).
+- **Error Handling**: Add more robustness (e.g., try-except around API calls).
+- **Testing**: Run with sample queries to verify the loop handles tool calls and final generation correctly.
+
+If you need adjustments, like adding RAG with embeddings or more tools, let me know!
