@@ -383,3 +383,141 @@ This is a from-scratch implementation using direct API calls.
 - **Testing**: Test RAG by adding docs and querying related topics. For tools, ask something like "What's the weather in London?".
 
 This setup provides a basic, framework-free AI agent. Scale by adding more tools or using a production vector DB.
+
+
+### 🔴 If i want to use gemini where do i needed to change codes
+
+To switch from OpenAI to Google's Gemini API in your Laravel-based AI agent setup, you'll need to update the backend code in `app/Services/AIAgentService.php` (and potentially the `.env` file). Gemini uses a different API structure, endpoints, and authentication, but it supports similar features like chat completions with tools and embeddings. Here's a step-by-step guide to the required changes:
+
+### 1. Update Environment Variables (.env File)
+- Replace or add the Gemini API key (obtain one from https://aistudio.google.com/app/apikey).
+- Change model names to Gemini equivalents (e.g., `gemini-1.5-flash` for chat, `text-embedding-004` for embeddings).
+- Update dimensions if needed (Gemini's text-embedding-004 uses 768 dimensions by default).
+
+Example updates in `.env`:
+```
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_CHAT_MODEL=gemini-1.5-flash  # Or gemini-1.5-pro for advanced
+GEMINI_EMBEDDING_MODEL=text-embedding-004
+GEMINI_EMBEDDING_DIMS=768  # Adjust based on the embedding model
+```
+
+### 2. Modify the AIAgentService Constructor
+Update to load Gemini-specific env vars instead of OpenAI's.
+
+```php
+public function __construct()
+{
+    $this->geminiApiKey = env('GEMINI_API_KEY');
+    $this->embeddingModel = env('GEMINI_EMBEDDING_MODEL', 'text-embedding-004');
+    $this->gptModel = env('GEMINI_CHAT_MODEL', 'gemini-1.5-flash');  // Rename if you want, but keeping for compatibility
+    $this->embeddingDims = env('GEMINI_EMBEDDING_DIMS', 768);
+    // Qdrant endpoint remains the same
+}
+```
+
+### 3. Replace the `callOpenAI` Method with a Gemini Equivalent
+Rename it to something like `callGemini` and update the HTTP request to use Gemini's API base URL and structure. Gemini's chat API uses `generateContent` instead of `chat/completions`, and the payload format differs slightly (e.g., messages are in `contents` array with `parts`).
+
+Add a new private method:
+```php
+private function callGemini($model, $data, $isEmbedding = false)
+{
+    $endpoint = $isEmbedding ? "models/{$model}:embedContent" : "models/{$model}:generateContent";
+    $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/';
+    
+    $response = Http::withHeaders([
+        'Content-Type' => 'application/json',
+    ])->post("{$baseUrl}{$endpoint}?key={$this->geminiApiKey}", $data);
+
+    if ($response->failed()) {
+        throw new \Exception('Gemini API error: ' . $response->body());
+    }
+
+    return $response->json();
+}
+```
+
+### 4. Update the `getEmbedding` Method
+Switch to Gemini's embedding endpoint and adjust the payload/response parsing.
+
+```php
+public function getEmbedding($text)
+{
+    $data = [
+        'model' => $this->embeddingModel,
+        'content' => [
+            'parts' => [['text' => $text]],
+        ],
+    ];
+    $response = $this->callGemini($this->embeddingModel, $data, true);
+    return $response['embedding']['values'];  // Gemini returns 'values' array
+}
+```
+
+### 5. Update the `processQuery` Method
+- Adapt the chat payload to Gemini's format: Use `contents` instead of `messages`, and structure as an array of role/content parts.
+- Tools in Gemini are called "function declarations" and use a similar schema.
+- Handle tool calls: Gemini returns `functionCalls` in the response candidates.
+- Adjust the loop to parse Gemini's response structure.
+
+Here's the updated method (replacing the OpenAI-specific parts):
+```php
+public function processQuery($query, $collectionName = 'default')
+{
+    $contents = [['role' => 'user', 'parts' => [['text' => $query]]]];  // Gemini uses 'contents' with 'parts'
+    $context = $this->retrieveContext($collectionName, $query);
+    $systemInstruction = ['role' => 'model', 'parts' => [['text' => "You are an AI agent. Use provided context if relevant. Context: $context"]]];  // System as first 'model' content
+
+    $maxIterations = 5;
+    $iteration = 0;
+
+    while ($iteration < $maxIterations) {
+        $data = [
+            'contents' => array_merge([$systemInstruction], $contents),
+            'tools' => [['functionDeclarations' => $this->getTools()]],  // Wrap tools in 'functionDeclarations'
+            'tool_config' => ['function_calling_config' => ['mode' => 'AUTO']],
+        ];
+
+        $response = $this->callGemini($this->gptModel, $data);
+        $candidate = $response['candidates'][0];  // Gemini uses 'candidates'
+        $content = $candidate['content'];
+
+        if (isset($content['parts'][0]['text'])) {
+            return $content['parts'][0]['text'];  // Final response text
+        }
+
+        if (isset($content['parts'][0]['functionCall'])) {  // Single tool call handling (extend for multiple if needed)
+            $functionCall = $content['parts'][0]['functionCall'];
+            $toolName = $functionCall['name'];
+            $args = json_encode($functionCall['args']);  // Args are already an object
+            $toolResult = $this->executeTool($toolName, $args);
+            
+            $contents[] = $content;  // Add assistant's function call
+            $contents[] = [
+                'role' => 'function',
+                'parts' => [['functionResponse' => [
+                    'name' => $toolName,
+                    'response' => ['content' => $toolResult],
+                ]]],
+            ];
+        }
+
+        $iteration++;
+    }
+
+    return 'Max iterations reached. Try simplifying your query.';
+}
+```
+
+### 6. Update the `getTools` Method (Slightly)
+Gemini's tool schema is very similar, but ensure parameters are in 'properties' with types. No major changes needed, but rename 'type' to 'function' if issues arise (it's already close).
+
+### Additional Notes
+- **Testing**: After changes, test embeddings and queries separately. Gemini's rate limits and costs differ, so monitor usage.
+- **Error Handling**: Add more robust parsing for Gemini's responses, as they might include safety blocks or multiple candidates.
+- **Tools Compatibility**: Gemini supports function calling, but the response format uses `functionCall` instead of `tool_calls`. If you have complex tools, check Google's docs for nuances.
+- **Qdrant and Frontend**: No changes needed there, as they don't depend on the LLM provider.
+- **Fallbacks**: If you want to support both OpenAI and Gemini, add a config flag (e.g., `LLM_PROVIDER=gemini`) and conditional logic in the methods.
+
+This should get your agent running with Gemini. If you encounter API-specific errors, refer to Google's Gemini API docs for exact payload examples.
